@@ -108,7 +108,7 @@ nằm ở cách ghi chứ không phải ở dữ liệu.
 | | |
 |---|---|
 | **Triệu chứng** | Sau ba lượt chạy, `gold_training_set` có 38.750 hàng trong khi đúng ra chỉ có 12.480. Checksum ba lượt khác nhau hoàn toàn, và có 12.480 ticket bị lặp. Điều làm em thấy khó là pipeline không báo lỗi gì cả, `dbt test` vẫn 9/9 pass. |
-| **Nguyên nhân** | Model để `materialized='incremental'` nhưng không khai `unique_key`. Không có khoá thì dbt không biết hàng nào ở bảng đích là "cùng một hàng" với hàng mới, nên nó chỉ sinh ra câu `INSERT`. Em có mở file `dbt/target/run/lab17/models/gold/gold_training_set.sql` để xem SQL thật mà dbt gửi xuống DuckDB và thấy đúng là `insert into` chứ không có `merge`. Mệnh đề `where` theo `run_date` thì chỉ giới hạn phần dữ liệu **đọc** từ nguồn, nó không quyết định gì về việc **ghi** vào bảng đích. Vì vậy chạy lại cùng một ngày lần thứ hai là ghi thêm chứ không ghi đè. Bản thân phép ghi đã không idempotent, nên mọi thứ chạy lại ở tầng trên — `retries=2` của Airflow, thao tác Clear Task, `catchup=True` khi DAG bật lại — đều thành ra thêm một bản sao đầy đủ. |
+| **Nguyên nhân** | Model để `materialized='incremental'` nhưng không khai `unique_key`. Không có khoá thì dbt không biết hàng nào ở bảng đích là "cùng một hàng" với hàng mới, nên nó chỉ sinh ra câu `INSERT` (em có kiểm chứng bằng cách đọc SQL thật dbt gửi xuống DuckDB, xem phụ lục A.5). Mệnh đề `where` theo `run_date` thì chỉ giới hạn phần dữ liệu **đọc** từ nguồn, nó không quyết định gì về việc **ghi** vào bảng đích. Vì vậy chạy lại cùng một ngày lần thứ hai là ghi thêm chứ không ghi đè. Bản thân phép ghi đã không idempotent, nên mọi thứ chạy lại ở tầng trên — `retries=2` của Airflow, thao tác Clear Task, `catchup=True` khi DAG bật lại — đều thành ra thêm một bản sao đầy đủ. |
 | **Cách khắc phục** | Trong `dbt/models/gold/gold_training_set.sql` em thêm `unique_key='ticket_id'` và `incremental_strategy='merge'` vào `config()`, giữ nguyên mệnh đề `where` như đề bài dặn. Trong `dags/ai_training_pipeline.py` em đặt `catchup=False` và `max_active_runs=1`. |
 | **Bằng chứng** | trước: 38.750 hàng, 12.480 ticket lặp · sau: 12.480 hàng, không ticket nào lặp · checksum ba lượt đều là `8dd7c98653` |
 
@@ -239,7 +239,7 @@ có tên, có cột `reject_reason` để người trực biết phải làm gì
 | | |
 |---|---|
 | **Triệu chứng** | Dashboard load 38 giây, ba tháng trước chỉ 2 giây, mà không ai sửa dòng code nào. Em đo bằng `make explain` thì thấy `rows scanned` = 5.000.000 cho một tập dữ liệu chỉ có 130.683 hàng thật. |
-| **Nguyên nhân** | Có hai chuyện cộng lại, và cùng dẫn tới một kết quả là engine không có cách nào biết file nào vô ích **trước khi mở file đó ra**. Thứ nhất là small-file problem: dataset gồm 5.000 file, mỗi file chỉ vài chục KB, không partition. DuckDB đọc Parquet theo lô và làm tròn lên theo từng file, nên một file mấy chục hàng vẫn tốn công quét như khoảng 1.000 hàng — 5.000 file tí hon thành ra 5.000.000 đơn vị công quét. Thứ hai là điều kiện lọc viết dạng `strftime(event_time, '%Y-%m-%d') = '2026-08-09'`, cột bị bọc trong một lời gọi hàm nên engine không so được nó với tên thư mục partition, cũng không so được với min/max của row group, đành phải đọc hết rồi mới lọc. Chi phí này tăng theo số file, nên tuy "không ai sửa gì" mà query vẫn chậm dần — thứ thay đổi là số file tích lại theo thời gian. |
+| **Nguyên nhân** | Có hai chuyện cộng lại, và cùng dẫn tới một kết quả là engine không có cách nào biết file nào vô ích **trước khi mở file đó ra**. Thứ nhất là small-file problem: dataset gồm 5.000 file, em đo thì mỗi file chỉ 2,3–4,0 KB (trung bình 3,2 KB, khoảng 26 hàng), và không partition. Theo docstring của `tools/explain.py` thì DuckDB đọc Parquet theo lô và làm tròn lên theo từng file, một file mấy chục hàng vẫn tốn công quét như khoảng 1.000 hàng — 5.000 file tí hon thành ra 5.000.000 đơn vị công quét, khớp với con số đo được. Thứ hai là điều kiện lọc viết dạng `strftime(event_time, '%Y-%m-%d') = '2026-08-09'`, cột bị bọc trong một lời gọi hàm nên engine không so được nó với tên thư mục partition, cũng không so được với min/max của row group, đành phải đọc hết rồi mới lọc. Chi phí này tăng theo số file, nên tuy "không ai sửa gì" mà query vẫn chậm dần — thứ thay đổi là số file tích lại theo thời gian. |
 | **Cách khắc phục** | Viết `tools/compact.py`: `COPY ... TO 'data/gold_events_v2' (format parquet, partition_by (event_date), row_group_size 2048)` với `order by customer_name, event_time`. Rồi sửa `queries/dashboard.sql` trỏ vào dataset mới, bật `hive_partitioning`, và đổi điều kiện thành `event_date = date '2026-08-09'` để cột đứng một mình ở một vế. |
 | **Bằng chứng** | `rows scanned` **5.000.000 → 9.324**, tức giảm **536,3×** (yêu cầu ≥ 10×) · `files` **5.000 → 14** · `result hash` vẫn là `4379e4c5d9f3`, không đổi · thời gian 10,5 ms |
 
@@ -253,16 +253,28 @@ em tạo lại đúng cái small-file problem đang phải chữa.
 
 *Sắp xếp theo `customer_name`.* Cột không nằm trong đường dẫn thì vẫn lọc được,
 nhưng bằng cơ chế khác là min/max của từng row group. Thống kê đó chỉ có ích khi
-các hàng của cùng một khách nằm gần nhau. Dữ liệu cũ xếp ngẫu nhiên nên row group
-nào cũng có min/max trải khắp bảng chữ cái, không loại được cái nào. Sau khi sắp
-xếp, em đọc metadata của file ngày 08-09 thì thấy các khoảng đã tách hẳn ra:
+các hàng của cùng một khách nằm gần nhau. Em đọc thử metadata của 5 file trong
+dataset cũ thì thấy đúng là vô dụng — file nào cũng khoảng 30 hàng và khoảng giá
+trị đều bắt đầu từ `ACME`:
+
+```
+part-00000.parquet   30 hàng   ACME -> Cust_0608
+part-00001.parquet   33 hàng   ACME -> Cust_0483
+part-00002.parquet   27 hàng   ACME -> Cust_0528
+part-00003.parquet   35 hàng   ACME -> Cust_0629
+part-00004.parquet   27 hàng   ACME -> Cust_0643
+```
+
+Khoảng nào cũng "có thể chứa ACME" nên engine không loại được file nào, buộc
+phải mở hết. Sau khi sắp xếp lại, em đọc metadata của file ngày 08-09 thì các
+khoảng đã tách hẳn ra:
 
 ```
 row_group   rows   customer_name min → max
     0       2048   ACME       → ACME
     1       2048   ACME       → Cust_0071
-    2       2048   Cust_0071  → Cust_0295      <- loại được khi lọc ACME
-    3       2048   Cust_0295  → Cust_0520      <- loại được khi lọc ACME
+    2       2048   Cust_0071  → Cust_0295      <- khoảng này không chứa ACME
+    3       2048   Cust_0295  → Cust_0520      <- khoảng này không chứa ACME
     4       1190   Cust_0002  → Cust_0650
 ```
 
@@ -482,6 +494,34 @@ priority rỗng: nguồn không gửi giá trị                              35
                                                                    ───
                                                                    312
 ```
+
+### A.5 · Nhiệm vụ 1 — SQL mà dbt thực sự gửi xuống DuckDB
+
+GUIDE.md mục 0b có chỉ cách xem câu lệnh thật dbt sinh ra, em thấy đây là cách
+kiểm chứng chắc chắn nhất nên có làm thử với cả hai phiên bản config.
+
+Với config gốc (chỉ có `materialized='incremental'`):
+
+```sql
+insert into "warehouse"."main"."gold_training_set" ("ticket_id", "customer_id", …)
+(
+    select "ticket_id", "customer_id", …
+    from "gold_training_set__dbt_tmp20260817123806947344"
+)
+```
+
+Sau khi thêm `unique_key` và `incremental_strategy`:
+
+```sql
+MERGE INTO "warehouse"."main"."gold_training_set" AS DBT_INTERNAL_DEST
+    USING "gold_training_set__dbt_tmp20260817114739354256" AS DBT_INTERNAL_SOURCE
+    ON (DBT_INTERNAL_SOURCE.ticket_id = DBT_INTERNAL_DEST.ticket_id)
+WHEN MATCHED     THEN UPDATE BY NAME
+WHEN NOT MATCHED THEN INSERT BY NAME
+```
+
+Câu đầu không có chỗ nào nhắc tới khoá, nên chạy lại là cộng thêm. Câu sau có
+`WHEN MATCHED THEN UPDATE`, nên chạy lại là ghi đè.
 
 ---
 
