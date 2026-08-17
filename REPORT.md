@@ -57,9 +57,43 @@
 Tổng kết: **4 / 4 tiêu chí đạt**. Dòng `dashboard rows scanned` ✗ thuộc bài mở
 rộng A trong `EXTRA.md` — không làm, không tính vào thang 100.
 
-Trạng thái khi tiếp nhận: **1 / 4**
-(`gold_training_set` 38.750 · `gold_feature_daily` 8.645 · `quarantine_tickets` 0
-· `silver_tickets.priority` 6.606 hàng sai · `dbt test` 9/9 pass).
+<details>
+<summary>Trạng thái khi tiếp nhận — <b>1 / 4</b> (output ba lượt chạy trước khi sửa)</summary>
+
+```
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LAB 17 · make verify
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  run 1/3 … 60.7s
+  run 2/3 … 59.4s
+  run 3/3 … 61.4s
+
+  BẢNG                  ỔN ĐỊNH          SỐ HÀNG     KỲ VỌNG   GHI CHÚ
+  ──────────────────────────────────────────────────────────────────────────
+  gold_training_set     ✗ FAIL            38,750      12,480   ✗ thừa 26,270 hàng
+  gold_feature_daily    ✓ ok               8,645       9,100   ✗ thiếu 455 hàng
+  gold_doc_chunks       ✓ ok              31,200      31,200   ✓
+  quarantine_tickets    ✓ ok                   0         312   ✗ thiếu 312 hàng
+
+  CHECKSUM từng lượt
+  ──────────────────────────────────────────────────────────────────────────
+  gold_training_set     7c461563f4    d11657ff21    2b76a4f850   ✗
+  gold_feature_daily    4eee63cd82    4eee63cd82    4eee63cd82   ✓
+  gold_doc_chunks       92d8e50131    92d8e50131    92d8e50131   ✓
+  quarantine_tickets    empty         empty         empty        ✓
+
+  KIỂM TRA KHÁC
+  ──────────────────────────────────────────────────────────────────────────
+  dbt test                                    ✓ 9/9 pass
+  silver_tickets.priority ∈ 1..4, không NULL  ✗ 6,606 hàng sai
+  quarantine_tickets đúng số bản ghi lỗi      ✗ 0 / 312
+  gold_training_set: 1 hàng / 1 ticket        ✗ 12,480 ticket bị lặp
+```
+
+Ba checksum khác nhau ở ba lượt của `gold_training_set` là bằng chứng trực tiếp
+của nhiệm vụ 1: cùng một đầu vào, ba kết quả khác nhau.
+
+</details>
 
 ---
 
@@ -161,7 +195,155 @@ bản ghi lỗi không bị bỏ qua im lặng: chúng nằm trong một bảng 
 
 ---
 
-## Phụ lục · Môi trường chạy
+## Phụ lục A · Nhật ký đo đạc
+
+Các số trích dẫn ở mục 2 và 3 đều lấy từ những lệnh dưới đây, chạy trên
+`warehouse.duckdb`.
+
+### A.1 · Nhiệm vụ 2 — phân bố độ trễ dữ liệu
+
+```sql
+select
+  quantile_cont(date_diff('second', event_time, _ingested_at)/86400.0, 0.50) as p50,
+  quantile_cont(date_diff('second', event_time, _ingested_at)/86400.0, 0.95) as p95,
+  quantile_cont(date_diff('second', event_time, _ingested_at)/86400.0, 0.99) as p99,
+  max(date_diff('second', event_time, _ingested_at)/86400.0)                 as max_ngay,
+  avg(case when _ingested_at > event_time + interval 1 day then 1.0 else 0 end) as ty_le_late
+from bronze_events;
+```
+
+```
+┌────────┬────────┬────────┬──────────┬────────────┐
+│  p50   │  p95   │  p99   │ max_ngay │ ty_le_late │
+├────────┼────────┼────────┼──────────┼────────────┤
+│  0.128 │  1.814 │  2.726 │    2.945 │     0.0505 │
+└────────┴────────┴────────┴──────────┴────────────┘
+```
+
+Phân bố theo ngày lịch — đây là căn cứ để lookback dừng ở 3 ngày:
+
+```
+┌──────────┬────────┐
+│ tre_ngay │   n    │
+├──────────┼────────┤
+│        0 │ 108862 │
+│        1 │  14165 │
+│        2 │   3842 │
+│        3 │   2593 │
+└──────────┴────────┘
+```
+
+### A.2 · Nhiệm vụ 3 — ba nhóm giá trị ở nguồn
+
+```sql
+select '[' || coalesce(priority_raw, '<NULL>') || ']' as val, count(*) as n
+from bronze_tickets_cdc group by 1 order by n desc;
+```
+
+```
+┌───────────┬───────┐          nhóm 1 (số hợp lệ)  : 1748+1710+1705+1683 =  6.846
+│    val    │   n   │          nhóm 2 (nhãn chữ)   : 1845+1819+1783+1695 =  7.142
+├───────────┼───────┤          nhóm 3 (rác)        :  312
+│ [low]     │  1845 │                                ─────────────────────────────
+│ [urgent]  │  1819 │          tổng bản ghi CDC    : 14.300
+│ [medium]  │  1783 │
+│ [4]       │  1748 │
+│ [3]       │  1710 │
+│ [1]       │  1705 │
+│ [high]    │  1695 │
+│ [2]       │  1683 │
+│ [0]       │    49 │
+│ []        │    43 │
+│ [unknown] │    39 │
+│ [P1]      │    39 │
+│ [P2]      │    38 │
+│ [5]       │    37 │
+│ [<NULL>]  │    35 │
+│ [-1]      │    32 │
+└───────────┴───────┘
+```
+
+Mốc thời gian nguồn đổi format — `count(*) filter (where try_cast(priority_raw
+as integer) is null)` theo ngày, nhảy vọt đúng 2026-08-10:
+
+```
+2026-08-03    0 /  897      2026-08-10    977 /  984
+2026-08-04    6 /  927      2026-08-11   1065 / 1071
+2026-08-05    8 / 1019      2026-08-12   1005 / 1007
+2026-08-06   14 /  974      2026-08-13   1045 / 1051
+2026-08-07   12 / 1012      2026-08-14   1053 / 1064
+2026-08-08   20 / 1083      2026-08-15   1047 / 1058
+2026-08-09   15 / 1054      2026-08-16   1069 / 1099
+```
+
+### A.3 · Nhiệm vụ 3 — `silver_tickets.priority` trước và sau
+
+**Trước** (tái hiện logic cũ: `try_cast`, xếp hạng trên toàn bộ bản ghi):
+
+```sql
+with ranked as (
+  select *, try_cast(priority_raw as integer) as p,
+         row_number() over (partition by ticket_id
+                            order by event_time desc, cdc_seq desc) as rn
+  from bronze_tickets_cdc
+)
+select p as priority, count(*) as n
+from ranked where rn = 1 and op <> 'd' group by 1 order by 1 nulls last;
+```
+
+```
+┌──────────┬───────┐
+│ priority │   n   │      tổng ticket : 12.480
+├──────────┼───────┤      hàng sai    :  6.606   (NULL 6.488 + ngoài miền 118)
+│       -1 │    32 │
+│        0 │    49 │      -> khớp đúng dòng "silver_tickets.priority ∈ 1..4,
+│        1 │  1458 │         không NULL  ✗ 6,606 hàng sai" của make verify
+│        2 │  1454 │
+│        3 │  1456 │      Bóc tách 6.488 NULL: 6.294 là nhãn chữ HỢP LỆ bị
+│        4 │  1506 │      try_cast vứt đi, chỉ 194 là chuỗi rác thật.
+│        5 │    37 │
+│     NULL │  6488 │
+└──────────┴───────┘
+```
+
+**Sau:**
+
+```
+┌──────────┬───────┐
+│ priority │   n   │      tổng : 12.480 hàng / 12.480 ticket
+├──────────┼───────┤      không còn NULL, không còn giá trị ngoài 1..4
+│        1 │  3134 │
+│        2 │  3029 │      không mất ticket nào: bản ghi hỏng bị loại TRƯỚC
+│        3 │  3115 │      row_number, ticket lùi về trạng thái hợp lệ gần nhất
+│        4 │  3202 │
+└──────────┴───────┘
+```
+
+### A.4 · Nhiệm vụ 3 — đối chiếu quarantine
+
+```
+quarantine_tickets                          : 312 hàng / 312 cặp (ticket_id, cdc_seq)
+đếm độc lập bản ghi rác trên bronze_tickets_cdc : 312
+```
+
+Hai con số bằng nhau nghĩa là quarantine **không thừa không thiếu**: mọi bản ghi
+bị loại khỏi Silver đều có mặt ở đây, và không có bản ghi hợp lệ nào bị bắt oan
+(7.142 nhãn chữ được map, không rơi vào quarantine).
+
+Phân loại lý do — để người trực biết ngay phải làm gì với từng nhóm:
+
+```
+priority là số nhưng ngoài miền 1..4                               118
+priority là chuỗi không có trong bảng quy đổi (urgent/high/…)      116
+priority rỗng: chuỗi trắng                                          43
+priority rỗng: nguồn không gửi giá trị                              35
+                                                                   ───
+                                                                   312
+```
+
+---
+
+## Phụ lục B · Môi trường chạy
 
 Máy chạy bài này là Windows, không có `make` và không có `python3`, nên
 Makefile không dùng được. Các script không phụ thuộc shell (`tools/run_pipeline.py`
