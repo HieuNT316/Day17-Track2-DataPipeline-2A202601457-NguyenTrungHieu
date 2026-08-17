@@ -30,11 +30,14 @@ with DAG(
     default_args=DEFAULT_ARGS,
     tags=["ai-support", "daily"],
     # ------------------------------------------------------------------
-    # TODO (nhiệm vụ 1): hai tham số dưới đây quyết định chuyện gì xảy ra
-    # khi ai đó bấm Clear Task, và khi DAG bị dồn nhiều lần chạy cùng lúc.
-    # Đọc lại triệu chứng ở phiếu #1041 rồi đặt lại cho đúng.
-    catchup=True,
-    # max_active_runs=?
+    # Nhiệm vụ 1 — hai tham số này giảm tần suất kích hoạt lỗi (không phải
+    # root cause; root cause nằm ở materialization của gold_training_set):
+    #   catchup=False        không tự dồn chạy bù mọi ngày quá khứ khi DAG
+    #                        được bật lại hoặc start_date bị lùi.
+    #   max_active_runs=1    hai run không được ghi đồng thời vào cùng bảng
+    #                        đích; mọi lần chạy lại là tuần tự.
+    catchup=False,
+    max_active_runs=1,
     # ------------------------------------------------------------------
 ) as dag:
 

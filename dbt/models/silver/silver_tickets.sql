@@ -35,16 +35,30 @@
 
 {{ config(materialized = 'table') }}
 
-with ranked as (
+with normalized as (
 
     select
         *,
-        {{ normalize_priority('priority_raw') }}             as priority_clean,
+        {{ normalize_priority('priority_raw') }}             as priority_clean
+    from {{ source('bronze', 'bronze_tickets_cdc') }}
+
+),
+
+-- LỌC TRƯỚC: bản ghi không chuẩn hoá được bị loại khỏi Silver (nó đi sang
+-- quarantine_tickets). Phải đứng trước row_number, nếu không thì ticket có
+-- bản ghi mới nhất bị hỏng sẽ mất hẳn khỏi Silver thay vì lùi về trạng thái
+-- hợp lệ gần nhất — loại BẢN GHI, không loại TICKET.
+valid as (select * from normalized where priority_clean is not null),
+
+ranked as (
+
+    select
+        *,
         row_number() over (
             partition by ticket_id
             order by event_time desc, cdc_seq desc
         ) as _rn
-    from {{ source('bronze', 'bronze_tickets_cdc') }}
+    from valid
 
 ),
 

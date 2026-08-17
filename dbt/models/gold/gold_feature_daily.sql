@@ -29,9 +29,14 @@
 --   rõ hai vấn đề này tách nhau.
 -- ---------------------------------------------------------------------------
 
+-- Grain gồm HAI cột -> unique_key là một list. Window rộng ra thì cùng một cặp
+-- (event_date, customer_id) được tính lại ở nhiều lượt; merge làm lần tính sau
+-- THAY THẾ lần trước thay vì cộng dồn.
 {{ config(
-    materialized     = 'incremental',
-    on_schema_change = 'fail'
+    materialized         = 'incremental',
+    unique_key           = ['event_date', 'customer_id'],
+    incremental_strategy = 'merge',
+    on_schema_change     = 'fail'
 ) }}
 
 select
@@ -49,7 +54,11 @@ select
 from {{ ref('silver_events') }}
 
 {% if is_incremental() %}
-where event_date > (select max(event_date) from {{ this }})
+-- Lookback window. Đo trên bronze_events: P99 độ trễ (_ingested_at - event_time)
+-- = 2,726 ngày, max = 2,945 ngày, 5,05% bản ghi tới kho muộn hơn một ngày.
+-- Lùi 3 ngày (làm tròn lên từ P99) để những ngày đã "chạy xong" vẫn được tính
+-- lại khi dữ liệu muộn về tới.
+where event_date >= (select max(event_date) from {{ this }}) - interval 3 day
 {% endif %}
 
 group by 1, 2, 3, 4

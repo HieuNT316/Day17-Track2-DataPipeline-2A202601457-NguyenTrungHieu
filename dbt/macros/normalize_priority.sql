@@ -45,16 +45,20 @@
 #}
 
 {% macro normalize_priority(col) %}
-    -- TODO(nhiệm vụ 3): thay biểu thức dưới đây bằng một khối CASE xử lý
-    -- đủ ba nhóm ở trên.
-    --
-    --     case
-    --         when <nhóm 1: đã là số hợp lệ>  then <giữ nguyên>
-    --         when <nhóm 2: nhãn chữ>         then <số tương ứng>
-    --         ...
-    --         else null                        -- nhóm 3
-    --     end
-    try_cast({{ col }} as integer)
+    case
+        -- Nhóm 1 — đã là số, nhưng chỉ nhận trong miền contract 1..4.
+        -- (try_cast một mình sẽ cho '0', '5', '-1' lọt qua.)
+        when try_cast({{ col }} as integer) between 1 and 4
+            then try_cast({{ col }} as integer)
+        -- Nhóm 2 — schema evolution: nguồn đổi cách biểu diễn từ 2026-08-10,
+        -- ý nghĩa không đổi. Quy về số theo tài liệu API của team backend.
+        when lower(trim({{ col }})) = 'urgent' then 1
+        when lower(trim({{ col }})) = 'high'   then 2
+        when lower(trim({{ col }})) = 'medium' then 3
+        when lower(trim({{ col }})) = 'low'    then 4
+        -- Nhóm 3 — 'P1' 'unknown' '0' '5' '-1' '' NULL: dữ liệu hỏng thật.
+        else null
+    end
 {% endmacro %}
 
 
@@ -64,6 +68,11 @@
     hơn (rỗng / NULL / là số nhưng ngoài khoảng / là chuỗi lạ).
 #}
 {% macro priority_reject_reason(col) %}
-    -- TODO(nhiệm vụ 3, không bắt buộc): phân biệt các loại lỗi khác nhau.
-    'priority không quy đổi được về 1..4'
+    case
+        when {{ col }} is null            then 'priority rỗng: nguồn không gửi giá trị'
+        when trim({{ col }}) = ''         then 'priority rỗng: chuỗi trắng'
+        when try_cast({{ col }} as integer) is not null
+            then 'priority là số nhưng ngoài miền 1..4'
+        else 'priority là chuỗi không có trong bảng quy đổi (urgent/high/medium/low)'
+    end
 {% endmacro %}
