@@ -13,9 +13,9 @@
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   LAB 17 · make verify
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  run 1/3 … 53.1s
-  run 2/3 … 61.4s
-  run 3/3 … 60.8s
+  run 1/3 … 57.8s
+  run 2/3 … 63.2s
+  run 3/3 … 63.5s
 
   BẢNG                  ỔN ĐỊNH          SỐ HÀNG     KỲ VỌNG   GHI CHÚ
   ──────────────────────────────────────────────────────────────────────────
@@ -37,8 +37,8 @@
   silver_tickets.priority ∈ 1..4, không NULL  ✓ sạch
   quarantine_tickets đúng số bản ghi lỗi      ✓ 312 / 312
   gold_training_set: 1 hàng / 1 ticket        ✓ không lặp
-  dashboard rows scanned                      ✗ 5,000,000 → 5,000,000 (1.0×, cần ≥ 10×)
-    số file parquet                           ✗ 5,000 → 5,000
+  dashboard rows scanned                      ✓ 5,000,000 → 9,324 (536.3×, cần ≥ 10×)
+    số file parquet                           ✓ 5,000 → 14
     kết quả truy vấn không đổi                ✓
   DAG: catchup / max_active_runs              ✓ False / 1
 
@@ -54,8 +54,8 @@
 
 </details>
 
-Tổng kết: **4 / 4 tiêu chí đạt**. Dòng `dashboard rows scanned` ✗ thuộc bài mở
-rộng A trong `EXTRA.md` — không làm, không tính vào thang 100.
+Tổng kết: **4 / 4 tiêu chí đạt**, cộng cả hai bài mở rộng (`dashboard rows
+scanned` ✓ và `make crash-test` ĐẠT ✓ — xem mục 4).
 
 <details>
 <summary>Trạng thái khi tiếp nhận — <b>1 / 4</b> (output ba lượt chạy trước khi sửa)</summary>
@@ -177,11 +177,88 @@ bản ghi lỗi không bị bỏ qua im lặng: chúng nằm trong một bảng 
 
 ---
 
-## 4 · *(mở rộng, không bắt buộc)* Bài trong EXTRA.md
+## 4 · *(mở rộng)* Bài trong EXTRA.md — làm cả hai
+
+### 4A · Query dashboard chậm
 
 | | |
 |---|---|
-| **Bài đã làm** | không làm |
+| **Triệu chứng** | Dashboard CSKH load 38 giây, ba tháng trước 2 giây, không ai sửa dòng code nào. Đo được: 5.000.000 `rows scanned` cho một tập chỉ có 130.683 hàng thật. |
+| **Nguyên nhân** | Hai vấn đề chồng lên nhau, cùng dẫn tới một hệ quả: engine không có cách nào biết file nào vô ích **trước khi mở nó**. (1) *Small-file problem* — dataset là 5.000 file vài chục KB, không partition; DuckDB đọc Parquet theo lô và làm tròn lên theo từng file, nên một file 26 hàng vẫn tốn công quét như ~1.000 hàng: 5.000 file tí hon = 5.000.000 đơn vị công quét. (2) *Predicate không sargable* — điều kiện viết là `strftime(event_time, '%Y-%m-%d') = '2026-08-09'`, cột bị bọc trong function call nên engine không so được nó với tên thư mục partition lẫn với min/max của row group; nó buộc phải giải nén toàn bộ rồi mới lọc. Chi phí này tăng tuyến tính theo số file, nên "không ai sửa gì" mà query vẫn chậm dần: cái thay đổi là **lượng file tích lại theo thời gian**. |
+| **Cách khắc phục** | `tools/compact.py`: `COPY ... TO 'data/gold_events_v2' (format parquet, partition_by (event_date), row_group_size 2048)` với `order by customer_name, event_time`. `queries/dashboard.sql`: trỏ vào dataset mới, bật `hive_partitioning`, đổi điều kiện thành `event_date = date '2026-08-09'` — cột đứng một mình ở một vế. |
+| **Bằng chứng** | `rows scanned` **5.000.000 → 9.324 (giảm 536,3×**, yêu cầu ≥ 10×) · `files` **5.000 → 14** · `result hash` `4379e4c5d9f3` **không đổi** · thời gian 10,5 ms |
+
+**Ba quyết định khi tái cấu trúc:**
+
+*Partition theo `event_date` chứ không theo `customer_name`.* Mỗi giá trị phân
+biệt là một thư mục: `event_date` có 14 giá trị → 14 thư mục, engine loại 13
+thư mục mà không mở file nào. `customer_name` có 650 giá trị → 650 thư mục file
+tí hon, tức tái tạo lại đúng small-file problem đang phải chữa.
+
+*Sắp xếp theo `customer_name`.* Cột không nằm trong đường dẫn vẫn lọc được, nhưng
+bằng cơ chế khác: min/max của từng row group. Thống kê đó chỉ có ích khi các hàng
+cùng một khách nằm liền nhau — dữ liệu cũ xếp ngẫu nhiên nên mọi row group đều có
+min/max phủ toàn bộ bảng chữ cái và không loại được cái nào. Sau khi sắp xếp,
+metadata của file ngày 08-09 cho thấy các khoảng đã tách rời hẳn:
+
+```
+row_group   rows   customer_name min → max
+    0       2048   ACME       → ACME
+    1       2048   ACME       → Cust_0071
+    2       2048   Cust_0071  → Cust_0295      <- loại được khi lọc ACME
+    3       2048   Cust_0295  → Cust_0520      <- loại được khi lọc ACME
+    4       1190   Cust_0002  → Cust_0650
+```
+
+*`row_group_size` 2048 thay vì mặc định 122.880.* Một ngày có ~9.300 hàng: để
+mặc định thì cả ngày gói gọn trong **một** row group, min/max của nó phủ đủ 650
+khách và trở lại vô dụng. 2048 chia ngày thành ~5 row group, mỗi cái phủ ~140
+khách.
+
+Con số `rows scanned` dừng ở 9.324 — đúng bằng số hàng của **một ngày** — nên
+phần giảm 536× đến từ partition pruning; row-group pruning không thể hiện thêm
+trên chỉ số này dù thống kê min/max đã dùng được như bảng trên.
+
+*Hướng sai đã loại trừ:* thêm index. Parquet nằm trên đĩa không có index — thứ
+duy nhất điều khiển được là **file nằm ở đâu** và **hàng nằm theo thứ tự nào
+trong file**.
+
+### 4B · Consumer gặp sự cố giữa batch
+
+| | |
+|---|---|
+| **Triệu chứng** | `make crash-test` giết consumer ở lô 7 rồi khởi động lại. Trước khi sửa: **mất dữ liệu** — offset đã commit tới 3.500 trong khi kho mới có 3.000 hàng, nên lần khởi động lại đọc tiếp từ 3.500 và 500 message của lô 7 biến mất vĩnh viễn. Không có lỗi nào được báo. |
+| **Nguyên nhân** | Thứ tự thao tác trong `consume()` là `commit()` → `write_batch()`, tức **ghi nhận đã xử lý xong trước khi thực sự xử lý**. Đó là ngữ nghĩa *at-most-once*: mọi sự cố rơi vào khe hở giữa hai thao tác đều thành mất dữ liệu, và mất im lặng — offset nói rằng lô đó đã xong nên không lần khởi động lại nào quay về đọc nó nữa. Exactly-once không tồn tại ở tầng giao vận; thứ chọn được chỉ là mất hay trùng. |
+| **Cách khắc phục** | `ingest/consumer.py`: đảo thành `write_batch()` → `commit()` (at-least-once), **và** làm phép ghi idempotent — thêm `primary key` trên `event_id` trong `DDL`, đổi `INSERT` thành `INSERT ... ON CONFLICT (event_id) DO UPDATE SET ...`. Thiếu một trong hai là chưa đủ: đảo thứ tự mà không upsert thì đổi mất dữ liệu lấy trùng dữ liệu. |
+| **Bằng chứng** | `make crash-test`: **ĐẠT ✓** — crash ở lô 7 → offset commit dừng ở **3.000**, lần khởi động lại đọc lại từ đó và ghi **17.000** message (thừa 500 hàng của lô 7 được phát lại) → **20.000 hàng / 20.000 `event_id`**, bằng đúng lượt chạy không sự cố. |
+
+Đối chiếu trước/sau trên cùng một kịch bản — chạy lại ở quy mô 5.000 message,
+cùng `batch_size` 500 và cùng điểm chết, để đo được cả trạng thái cũ:
+
+```
+                        offset commit    hàng đã ghi    kết quả sau restart
+trước (commit -> write)      3.500           3.000      4.500  -> MẤT 500
+sau   (write -> commit)      3.000           3.500      5.000  -> đủ, không trùng
+```
+
+Hai dòng này là hai ngữ nghĩa, đọc được ngay từ vị trí tương đối của hai con số
+đầu. Offset chạy **trước** dữ liệu (3.500 > 3.000) = at-most-once: khe hở thành
+dữ liệu mất, không lấy lại được. Dữ liệu chạy **trước** offset (3.500 > 3.000
+theo chiều ngược lại) = at-least-once: khe hở thành dữ liệu phát lại, và phát
+lại thì `write_batch()` upsert đè lên nên tự khử.
+
+**`DO UPDATE` khác `DO NOTHING` ở đâu khi message được phát lại với nội dung đã
+đổi?** `DO NOTHING` giữ bản ghi cũ, `DO UPDATE` ghi đè bằng bản mới. Nếu nguồn
+sửa lại một message rồi gửi lại dưới cùng `event_id`, `DO NOTHING` sẽ khiến kho
+vĩnh viễn lệch khỏi nguồn mà không báo gì, còn `DO UPDATE` hội tụ về trạng thái
+mới nhất. Chọn `DO UPDATE`: `event_id` ở đây là khoá của một **thực thể có thể
+được sửa**, không phải mã của một lần giao message.
+
+**Ghi chú hiệu năng.** `executemany()` gửi từng hàng một; kèm `ON CONFLICT` nó
+chỉ đạt ~145 hàng/s trên máy đo, khiến `make crash-test` chạy quá 10 phút. Gộp
+cả lô vào **một** câu lệnh `INSERT ... VALUES (...), (...), …` cho ~625 hàng/s
+(nhanh hơn cả bản `INSERT` thuần ban đầu, ~270 hàng/s) và crash-test về lại
+khoảng một phút.
 
 ---
 
@@ -359,6 +436,16 @@ PYTHONUTF8=1 .venv/Scripts/python tools/verify.py         # = make verify
 
 `PYTHONUTF8=1` là bắt buộc: console Windows mặc định cp1252 nên các script in
 tiếng Việt sẽ dừng vì `UnicodeEncodeError`.
+
+Thứ tự chạy trên repo sạch — `queries/dashboard.sql` đã trỏ vào dataset v2 nên
+**phải** dựng nó trước khi đo:
+
+```bash
+python seed/generate.py --extra   # = make seed-extra  (tạo data/gold_events/)
+python tools/compact.py           # = make compact     (tạo data/gold_events_v2/)
+python tools/verify.py            # = make verify
+python tools/crash_test.py        # = make crash-test
+```
 
 Ngoài ra `expected/dashboard_baseline.json` được commit sẵn trong repo, nên
 `tools/verify.py` luôn cho rằng dữ liệu bài mở rộng đã tồn tại và đi query

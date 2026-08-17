@@ -53,7 +53,7 @@ TABLE = "bronze_events_stream"
 
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -66,20 +66,45 @@ create table if not exists {TABLE} (
 
 
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
-    """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
+    """Ghi một lô message xuống kho — phép ghi IDEMPOTENT.
 
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
+    At-least-once ở tầng giao vận nghĩa là một lô CÓ THỂ được phát lại. Upsert
+    theo event_id làm lần ghi thứ hai trở thành phép gán đè lên đúng hàng cũ,
+    nên phát lại bao nhiêu lần cũng cho cùng một trạng thái kho.
+
+    Chọn DO UPDATE chứ không DO NOTHING: nếu message được phát lại với nội dung
+    đã đổi (nguồn sửa lại rồi gửi lại cùng event_id), DO NOTHING sẽ giữ bản cũ
+    và kho vĩnh viễn lệch khỏi nguồn, còn DO UPDATE hội tụ về bản mới nhất.
     """
-    con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
-                r["event_type"], r["latency_ms"], r["event_time"], r["_ingested_at"],
-            )
-            for r in batch
-        ],
+    if not batch:
+        return
+
+    # Cả lô đi trong MỘT câu lệnh. executemany() gửi từng hàng một: với
+    # on conflict nó chỉ đạt ~145 hàng/s nên crash-test chạy hơn 10 phút.
+    # (Giả định: trong cùng một lô không có event_id lặp — DuckDB không cho
+    #  một câu lệnh update cùng một hàng hai lần.)
+    tuples = ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(batch))
+    params = [
+        v
+        for r in batch
+        for v in (
+            r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
+            r["event_type"], r["latency_ms"], r["event_time"], r["_ingested_at"],
+        )
+    ]
+    con.execute(
+        f"""
+        insert into {TABLE} values {tuples}
+        on conflict (event_id) do update set
+            ticket_id     = excluded.ticket_id,
+            customer_id   = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            event_type    = excluded.event_type,
+            latency_ms    = excluded.latency_ms,
+            event_time    = excluded.event_time,
+            _ingested_at  = excluded._ingested_at
+        """,
+        params,
     )
 
 
@@ -109,12 +134,14 @@ def consume(
                 break
             batch_no += 1
 
-            # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
-            # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
-            # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            # ── AT-LEAST-ONCE: ghi trước, commit offset sau ────────────────
+            # Chết ở maybe_crash() nghĩa là lô đã nằm trong kho nhưng offset
+            # chưa dịch, nên lần khởi động lại đọc lại chính lô đó — thà trùng
+            # còn hơn mất, vì trùng thì write_batch() upsert đè lên và tự khử,
+            # còn mất thì không có cơ chế nào lấy lại được.
             write_batch(con, batch)           # ghi dữ liệu
+            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            consumer.commit()                 # ghi nhận offset
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)
